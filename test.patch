@@ -1,0 +1,142 @@
+diff --git a/src/mcp_obsidian/obsidian.py b/src/mcp_obsidian/obsidian.py
+index 0000000..1111111 100644
+--- a/src/mcp_obsidian/obsidian.py
++++ b/src/mcp_obsidian/obsidian.py
+@@ -1,6 +1,8 @@
+ import requests
+ import urllib.parse
+ import os
++import re
++from pathlib import Path
+ from typing import Any
+ 
+ class Obsidian():
+@@ -264,3 +266,58 @@ class Obsidian():
+ 
+         return self._safe_call(call_fn)
+ 
++    def get_backlinks(self, target_path: str, vault_path: str) -> list[dict]:
++        target_path_obj = Path(vault_path) / target_path
++        
++        if not target_path_obj.exists():
++            raise Exception(f"Target file does not exist: {target_path}")
++        
++        target_name = target_path_obj.stem
++        
++        target_content = target_path_obj.read_text()
++        aliases = self._extract_aliases(target_content)
++        
++        backlinks = []
++        seen_paths = set()
++        
++        for note_path in Path(vault_path).rglob("*.md"):
++            if note_path == target_path_obj:
++                continue
++            
++            rel_path = str(note_path.relative_to(vault_path))
++            
++            if rel_path in seen_paths:
++                continue
++            
++            content = note_path.read_text()
++            
++            if self._has_link_to_target(content, target_name, target_path, aliases):
++                backlinks.append({
++                    "path": rel_path,
++                    "filename": note_path.name
++                })
++                seen_paths.add(rel_path)
++        
++        return backlinks
++    
++    def _extract_aliases(self, content: str) -> list[str]:
++        frontmatter_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
++        if not frontmatter_match:
++            return []
++        
++        aliases_match = re.search(r'aliases:\s*\[(.*?)\]', frontmatter_match.group(1))
++        if not aliases_match:
++            return []
++        
++        aliases_str = aliases_match.group(1)
++        return [a.strip().strip('"\'') for a in aliases_str.split(',')]
++    
++    def _has_link_to_target(self, content: str, target_name: str, target_path: str, aliases: list[str]) -> bool:
++        content_no_code = re.sub(r'```.*?```', '', content, flags=re.DOTALL)
++        content_no_code = re.sub(r'`.*?`', '', content_no_code)
++        
++        wikilink_pattern = r'(?<!\\)\[\[(.*?)\]\]'
++        links = re.findall(wikilink_pattern, content_no_code)
++        
++        for link in links:
++            link_target = link.split('|')[0].strip()
++            link_target = link_target.split('#')[0].strip()
++            link_stem = link_target.replace('.md', '')
++            
++            if link_stem == target_name or link_target in aliases:
++                return True
++        
++        return False
+diff --git a/src/mcp_obsidian/server.py b/src/mcp_obsidian/server.py
+index 2222222..3333333 100644
+--- a/src/mcp_obsidian/server.py
++++ b/src/mcp_obsidian/server.py
+@@ -55,6 +55,7 @@ add_tool_handler(tools.BatchGetFileContentsToolHandler())
+ add_tool_handler(tools.PeriodicNotesToolHandler())
+ add_tool_handler(tools.RecentPeriodicNotesToolHandler())
+ add_tool_handler(tools.RecentChangesToolHandler())
++add_tool_handler(tools.BacklinkDiscoveryToolHandler())
+ 
+ @app.list_tools()
+ async def list_tools() -> list[Tool]:
+diff --git a/src/mcp_obsidian/tools.py b/src/mcp_obsidian/tools.py
+index 4444444..5555555 100644
+--- a/src/mcp_obsidian/tools.py
++++ b/src/mcp_obsidian/tools.py
+@@ -631,3 +631,46 @@ class RecentChangesToolHandler(ToolHandler):
+                 text=json.dumps(results, indent=2)
+             )
+         ]
++
++class BacklinkDiscoveryToolHandler(ToolHandler):
++    def __init__(self):
++        super().__init__("obsidian_get_backlinks")
++
++    def get_tool_description(self):
++        return Tool(
++            name=self.name,
++            description="Discover all notes that contain wikilinks pointing to a specified target note.",
++            inputSchema={
++                "type": "object",
++                "properties": {
++                    "target_path": {
++                        "type": "string",
++                        "description": "Path to the target note (relative to vault root)",
++                        "format": "path"
++                    },
++                    "vault_path": {
++                        "type": "string",
++                        "description": "Absolute path to the vault directory (for testing)",
++                        "format": "path"
++                    }
++                },
++                "required": ["target_path"]
++            }
++        )
++
++    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
++        if "target_path" not in args:
++            raise RuntimeError("target_path argument missing in arguments")
++
++        target_path = args["target_path"]
++        vault_path = args.get("vault_path")
++        
++        if vault_path:
++            api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
++            backlinks = api.get_backlinks(target_path, vault_path)
++        else:
++            raise RuntimeError("vault_path is required for backlink discovery")
++
++        return [
++            TextContent(type="text", text=json.dumps(backlinks, indent=2))
++        ]
